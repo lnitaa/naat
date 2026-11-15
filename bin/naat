@@ -1,0 +1,784 @@
+#!/usr/bin/env bash
+# =============================================================================
+# naat - toolbox CLI
+#
+# Downloads, runs and executes the scripts (tools) stored in the private
+# GitHub repository "banyan". The GitHub token that gives access to banyan is
+# never stored in clear text: it lives encrypted (age, passphrase mode) in
+# the public "naat" repository, and is decrypted on the fly with the secret
+# phrase entered once in `naat configure`.
+#
+#   naat configure                  enter the secret phrase
+#   naat configure list             review the configuration
+#   naat update-banyan-token TOKEN  encrypt a new banyan token with the phrase
+#   naat list                       tools available in banyan
+#   naat download NAME              download a tool and open it in an editor
+#   naat execute  NAME [ARGS]       temporary download, run, remove
+#   naat run      NAME [ARGS]       run a tool that was already downloaded
+#
+# Exit codes: 0 ok, 1 error, 2 wrong usage. `run` and `execute` return the
+# exit code of the script they launched.
+# =============================================================================
+set -euo pipefail
+
+NAAT_VERSION="0.1.0"
+
+NAAT_HOME="${NAAT_HOME:-$HOME/.naat}"
+CONFIG_FILE="$NAAT_HOME/config"
+TOKEN_FILE="$NAAT_HOME/banyan-token.age"
+TOKEN_REPO_PATH="credentials/banyan-token.age"
+
+# Overridable for tests / GitHub Enterprise.
+API_URL="${NAAT_API_URL:-https://api.github.com}"
+RAW_URL="${NAAT_RAW_URL:-https://raw.githubusercontent.com}"
+
+CONFIG_KEYS=(owner naat_repo naat_branch tools_repo ref scripts_dir editor phrase)
+declare -A CFG=(
+    [owner]="lnitaa"        # GitHub account that owns both repositories
+    [naat_repo]="naat"      # public repo: this CLI + the encrypted token
+    [naat_branch]="main"
+    [tools_repo]="banyan"   # private repo: the tools
+    [ref]="auto"            # auto | latest | <branch> | <tag>
+    [scripts_dir]=""        # empty = $NAAT_HOME/scripts
+    [editor]=""             # empty = $VISUAL / $EDITOR / nano / vim / vi
+    [phrase]=""
+)
+
+TOKEN=""
+FILE_PHRASE=""
+REF=""
+AGE_DIR=""
+WORK=""
+PROMPT_INTERACTIVE=1
+TOKEN_REFRESHED=0
+HTTP_CODE=""
+OPT_REF=""
+
+# ----------------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------------
+info() { printf '%s\n' "$*" >&2; }
+warn() { printf 'naat: warning: %s\n' "$*" >&2; }
+die()  { printf 'naat: error: %s\n' "$*" >&2; exit 1; }
+usage_error() { printf 'naat: %s\n' "$*" >&2; info "Try 'naat help'."; exit 2; }
+
+cleanup() {
+    if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf "$WORK"; fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+make_work() {
+    [[ -n "$WORK" ]] && return 0
+    mkdir -p "$NAAT_HOME/tmp"
+    chmod 700 "$NAAT_HOME" "$NAAT_HOME/tmp"
+    WORK="$(mktemp -d "$NAAT_HOME/tmp/naat.XXXXXXXX")"
+}
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed."; }
+
+scripts_dir() {
+    if [[ -n "${CFG[scripts_dir]}" ]]; then printf '%s' "${CFG[scripts_dir]}"
+    else printf '%s' "$NAAT_HOME/scripts"; fi
+}
+
+# ----------------------------------------------------------------------------
+# configuration file (plain key=value, never sourced)
+# ----------------------------------------------------------------------------
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local line key
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line%$'\r'}"
+            [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
+            key="${line%%=*}"
+            if [[ -n "${CFG[$key]+x}" ]]; then CFG[$key]="${line#*=}"; fi
+        done < "$CONFIG_FILE"
+    fi
+    FILE_PHRASE="${CFG[phrase]}"
+    # Automation / future UI can inject the phrase without a config file.
+    if [[ -n "${NAAT_PHRASE:-}" ]]; then CFG[phrase]="$NAAT_PHRASE"; fi
+}
+
+save_config() {
+    mkdir -p "$NAAT_HOME"
+    chmod 700 "$NAAT_HOME"
+    local tmp="$CONFIG_FILE.tmp.$$" k
+    (
+        umask 077
+        {
+            echo "# naat configuration - keep this file private (it holds the secret phrase)"
+            for k in "${CONFIG_KEYS[@]}"; do printf '%s=%s\n' "$k" "${CFG[$k]}"; done
+        } > "$tmp"
+    )
+    mv -f "$tmp" "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+}
+
+# ----------------------------------------------------------------------------
+# encryption (vendored age + age-plugin-batchpass, shipped in the naat repo)
+# ----------------------------------------------------------------------------
+find_age() {
+    [[ -n "$AGE_DIR" ]] && return 0
+    local self dir arch d
+    self="$(readlink -f "${BASH_SOURCE[0]}")"
+    dir="$(dirname "$self")"
+    case "$(uname -m)" in
+        x86_64|amd64)  arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *)             arch="unknown" ;;
+    esac
+    for d in "${NAAT_AGE_DIR:-}" "$dir/../lib/naat" "$dir/../vendor/age/linux-$arch"; do
+        if [[ -n "$d" && -x "$d/age" && -x "$d/age-plugin-batchpass" ]]; then
+            AGE_DIR="$(cd "$d" && pwd)"
+            return 0
+        fi
+    done
+    die "the bundled 'age' binaries were not found. Reinstall naat (install-banyan.sh)."
+}
+
+# age_encrypt PHRASE   (plaintext on stdin, ASCII-armored ciphertext on stdout)
+age_encrypt() {
+    find_age
+    PATH="$AGE_DIR:$PATH" AGE_PASSPHRASE="$1" "$AGE_DIR/age" -e -a -j batchpass
+}
+
+# age_decrypt PHRASE FILE   (plaintext on stdout)
+age_decrypt() {
+    find_age
+    PATH="$AGE_DIR:$PATH" AGE_PASSPHRASE="$1" "$AGE_DIR/age" -d -j batchpass "$2" 2>/dev/null
+}
+
+# ----------------------------------------------------------------------------
+# secret prompts
+# ----------------------------------------------------------------------------
+# prompt_secret "Prompt: "  -> value in $REPLY_SECRET
+prompt_secret() {
+    REPLY_SECRET=""
+    PROMPT_INTERACTIVE=1
+    if [[ -t 0 ]]; then
+        IFS= read -r -s -p "$1" REPLY_SECRET || true
+        echo >&2
+    elif [[ -r /dev/tty && -w /dev/tty ]] && { : < /dev/tty; } 2>/dev/null; then
+        IFS= read -r -s -p "$1" REPLY_SECRET < /dev/tty || true
+        echo >&2
+    else
+        # not interactive: take one line from stdin (pipes, future UI)
+        PROMPT_INTERACTIVE=0
+        IFS= read -r REPLY_SECRET || true
+    fi
+    REPLY_SECRET="${REPLY_SECRET%$'\r'}"
+}
+
+check_phrase_strength() {
+    if (( ${#1} < 20 )); then
+        warn "the phrase is short (${#1} characters). The encrypted token is stored in a"
+        warn "PUBLIC repository, so anyone can try to guess the phrase offline."
+        warn "Use a long phrase (5+ random words / 20+ characters)."
+    fi
+}
+
+require_phrase() {
+    [[ -n "${CFG[phrase]}" ]] || die "no secret phrase configured. Run: naat configure"
+}
+
+# ----------------------------------------------------------------------------
+# encrypted token: fetch from the public naat repo, decrypt
+# ----------------------------------------------------------------------------
+# fetch_token_file DEST  -> 0 downloaded, 1 not published yet, 2 network/other error
+fetch_token_file() {
+    need_cmd curl
+    local url code
+    url="$RAW_URL/${CFG[owner]}/${CFG[naat_repo]}/${CFG[naat_branch]}/$TOKEN_REPO_PATH"
+    code="$(curl -sS -L -o "$1" -w '%{http_code}' -A "naat/$NAAT_VERSION" "$url" 2>/dev/null)" || return 2
+    case "$code" in
+        200) grep -q 'BEGIN AGE ENCRYPTED FILE' "$1" || return 2 ;;
+        404) return 1 ;;
+        *)   return 2 ;;
+    esac
+}
+
+install_token_file() {   # install_token_file SRC
+    mkdir -p "$NAAT_HOME"
+    chmod 700 "$NAAT_HOME"
+    ( umask 077; cat "$1" > "$TOKEN_FILE.tmp.$$" )
+    mv -f "$TOKEN_FILE.tmp.$$" "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+}
+
+sync_token() {
+    make_work
+    local rc=0
+    fetch_token_file "$WORK/token.age" || rc=$?
+    case "$rc" in
+        0) install_token_file "$WORK/token.age" ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+get_token() {
+    [[ -n "$TOKEN" ]] && return 0
+    require_phrase
+    if [[ ! -f "$TOKEN_FILE" ]]; then
+        local rc=0
+        sync_token || rc=$?
+        if (( rc == 1 )); then
+            die "no encrypted token published yet in ${CFG[owner]}/${CFG[naat_repo]} ($TOKEN_REPO_PATH). Run: naat update-banyan-token"
+        elif (( rc != 0 )); then
+            die "could not download the encrypted token from ${CFG[owner]}/${CFG[naat_repo]} (network?)."
+        fi
+    fi
+    TOKEN="$(age_decrypt "${CFG[phrase]}" "$TOKEN_FILE")" \
+        || die "the secret phrase does not decrypt the banyan token. Run: naat configure"
+    TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
+    [[ -n "$TOKEN" ]] || die "the decrypted banyan token is empty. Run: naat update-banyan-token"
+}
+
+# ----------------------------------------------------------------------------
+# GitHub API
+# ----------------------------------------------------------------------------
+# gh_request TOKEN ACCEPT URL OUTFILE -> prints the HTTP status code
+# The token goes through a curl config on stdin, so it never shows up in `ps`.
+gh_request() {
+    curl -sS -L -o "$4" -w '%{http_code}' -K - <<EOF
+url = "$3"
+header = "Authorization: Bearer $1"
+header = "Accept: $2"
+header = "X-GitHub-Api-Version: 2022-11-28"
+user-agent = "naat/$NAAT_VERSION"
+EOF
+}
+
+# gh_api ACCEPT URL OUTFILE -> HTTP status code in $HTTP_CODE.
+# On 401 it refreshes the encrypted token from the naat repo once and retries
+# (covers "the token was rotated with update-banyan-token on another machine").
+gh_api() {
+    local code
+    code="$(gh_request "$TOKEN" "$1" "$2" "$3")" || die "could not reach GitHub ($API_URL)."
+    if [[ "$code" == "401" && "$TOKEN_REFRESHED" == "0" ]]; then
+        TOKEN_REFRESHED=1
+        if sync_token; then
+            local fresh
+            if fresh="$(age_decrypt "${CFG[phrase]}" "$TOKEN_FILE")"; then
+                fresh="$(printf '%s' "$fresh" | tr -d '[:space:]')"
+                if [[ -n "$fresh" && "$fresh" != "$TOKEN" ]]; then
+                    TOKEN="$fresh"
+                    code="$(gh_request "$TOKEN" "$1" "$2" "$3")" || die "could not reach GitHub ($API_URL)."
+                fi
+            fi
+        fi
+    fi
+    HTTP_CODE="$code"
+}
+
+api_fail() {   # api_fail CODE WHAT
+    case "$1" in
+        401) die "GitHub rejected the banyan token (expired or revoked). Create a new one and run: naat update-banyan-token" ;;
+        403) die "GitHub denied access while $2 (token permissions or rate limit)." ;;
+        404) die "not found while $2. Check that the token can read ${CFG[owner]}/${CFG[tools_repo]}." ;;
+        409) die "the repository ${CFG[owner]}/${CFG[tools_repo]} is empty." ;;
+        *)   die "GitHub answered HTTP $1 while $2." ;;
+    esac
+}
+
+json_str() {   # json_str KEY FILE -> first string value of "KEY"
+    { tr -d '\n' < "$2" | grep -o "\"$1\": *\"[^\"]*\"" | head -n 1 \
+        | sed 's/^[^:]*: *"\(.*\)"$/\1/'; } || true
+}
+
+repo_api() { printf '%s/repos/%s/%s' "$API_URL" "${CFG[owner]}" "${CFG[tools_repo]}"; }
+
+resolve_ref() {
+    [[ -n "$REF" ]] && return 0
+    local want="${OPT_REF:-${CFG[ref]}}" code tag
+    case "$want" in
+        auto|latest)
+            gh_api "application/vnd.github+json" "$(repo_api)/releases/latest" "$WORK/release.json"; code="$HTTP_CODE"
+            if [[ "$code" == "200" ]]; then
+                tag="$(json_str tag_name "$WORK/release.json")"
+                if [[ -n "$tag" ]]; then REF="$tag"; return 0; fi
+            elif [[ "$code" != "404" ]]; then
+                api_fail "$code" "looking for the latest release"
+            fi
+            [[ "$want" == "latest" ]] && die "${CFG[owner]}/${CFG[tools_repo]} has no published release (or the token cannot read it)."
+            gh_api "application/vnd.github+json" "$(repo_api)" "$WORK/repo.json"; code="$HTTP_CODE"
+            [[ "$code" == "200" ]] || api_fail "$code" "reading the repository"
+            REF="$(json_str default_branch "$WORK/repo.json")"
+            [[ -n "$REF" ]] || REF="main"
+            ;;
+        *) REF="$want" ;;
+    esac
+}
+
+# Fills $WORK/tree.txt with the path of every file in the repo at $REF.
+load_tree() {
+    need_cmd curl
+    make_work
+    get_token
+    resolve_ref
+    [[ -f "$WORK/tree.txt" ]] && return 0
+    local code
+    gh_api "application/vnd.github+json" "$(repo_api)/git/trees/$REF?recursive=1" "$WORK/tree.json"; code="$HTTP_CODE"
+    [[ "$code" == "200" ]] || api_fail "$code" "listing the files of '$REF'"
+    { tr -d '\n' < "$WORK/tree.json" | tr '{' '\n' | grep '"type": *"blob"' \
+        | sed -n 's/.*"path": *"\([^"]*\)".*/\1/p' | LC_ALL=C sort > "$WORK/tree.txt"; } || true
+}
+
+urlencode_path() {
+    local s="$1"
+    s="${s//%/%25}"; s="${s// /%20}"; s="${s//#/%23}"; s="${s//\?/%3F}"; s="${s//+/%2B}"
+    printf '%s' "$s"
+}
+
+download_file() {   # download_file REPO_PATH DEST
+    local code
+    mkdir -p "$(dirname "$2")"
+    gh_api "application/vnd.github.raw+json" "$(repo_api)/contents/$(urlencode_path "$1")?ref=$REF" "$2"; code="$HTTP_CODE"
+    [[ "$code" == "200" ]] || api_fail "$code" "downloading $1"
+}
+
+tool_name() { local n="${1%.sh}"; printf '%s' "${n##*/}"; }
+
+# resolve_tool NAME -> sets TOOL_PATH (path of NAME.sh inside banyan)
+# NAME may be "s3_restore", "s3_restore.sh" or a path "dir/sub/s3_restore".
+resolve_tool() {
+    local n="${1%.sh}"
+    n="${n#/}"
+    [[ -n "$n" ]] || usage_error "missing tool name."
+    local -a matches=()
+    mapfile -t matches < <(awk -v n="$n.sh" '
+        $0 == n { print; next }
+        length($0) > length(n) && substr($0, length($0) - length(n)) == "/" n { print }
+    ' "$WORK/tree.txt")
+    if (( ${#matches[@]} == 0 )); then
+        die "no tool named '$n' in ${CFG[owner]}/${CFG[tools_repo]} ($REF). See: naat list"
+    elif (( ${#matches[@]} > 1 )); then
+        info "naat: '$n' is ambiguous in ${CFG[owner]}/${CFG[tools_repo]} ($REF):"
+        printf '  %s\n' "${matches[@]%.sh}" >&2
+        die "use the full path, e.g.: naat download ${matches[0]%.sh}"
+    fi
+    TOOL_PATH="${matches[0]}"
+}
+
+# fetch_tool REPO_PATH DEST_DIR
+# A tool is the script plus everything that lives in its folder (helper .sql
+# files, sub-folders...), because scripts reference siblings via SCRIPT_DIR.
+# A script sitting at the root of the repo is downloaded alone.
+fetch_tool() {
+    local path="$1" dest="$2" dir f rel
+    local -a files=()
+    dir="$(dirname "$path")"
+    if [[ "$dir" == "." ]]; then
+        files=("$path")
+    else
+        mapfile -t files < <(awk -v p="$dir/" 'index($0, p) == 1' "$WORK/tree.txt")
+    fi
+    mkdir -p "$dest"
+    chmod 700 "$dest"
+    for f in "${files[@]}"; do
+        if [[ "$dir" == "." ]]; then rel="$f"; else rel="${f#"$dir"/}"; fi
+        case "/$rel/" in */../*) die "unsafe path in repository: $f" ;; esac
+        download_file "$f" "$dest/$rel"
+        if [[ "$rel" == *.sh ]]; then
+            # scripts edited on Windows may carry CRLF, which breaks bash
+            if grep -q $'\r$' "$dest/$rel"; then sed -i 's/\r$//' "$dest/$rel"; fi
+            chmod 700 "$dest/$rel"
+        else
+            chmod 600 "$dest/$rel"
+        fi
+    done
+    info "  ${#files[@]} file(s) from ${CFG[owner]}/${CFG[tools_repo]}@$REF:$dir"
+}
+
+pick_editor() {
+    local e
+    for e in "${CFG[editor]}" "${NAAT_EDITOR:-}" "${VISUAL:-}" "${EDITOR:-}" nano vim vi; do
+        [[ -n "$e" ]] || continue
+        if command -v "${e%% *}" >/dev/null 2>&1; then printf '%s' "$e"; return 0; fi
+    done
+    return 1
+}
+
+# ----------------------------------------------------------------------------
+# commands
+# ----------------------------------------------------------------------------
+cmd_configure() {
+    case "${1:-}" in
+        "")   configure_phrase ;;
+        list) configure_list ;;
+        set)  shift; configure_set "$@" ;;
+        get)  shift; configure_get "$@" ;;
+        *)    usage_error "unknown 'configure' sub-command: $1" ;;
+    esac
+}
+
+configure_phrase() {
+    local phrase rc=0
+    if [[ -n "${NAAT_PHRASE:-}" ]]; then
+        phrase="$NAAT_PHRASE"
+    else
+        prompt_secret "Enter secret phrase: "
+        phrase="$REPLY_SECRET"
+    fi
+    [[ -n "$phrase" ]] || die "the phrase cannot be empty."
+
+    make_work
+    fetch_token_file "$WORK/token.age" || rc=$?
+    if (( rc == 0 )); then
+        age_decrypt "$phrase" "$WORK/token.age" >/dev/null \
+            || die "that phrase does not decrypt the banyan token published in ${CFG[owner]}/${CFG[naat_repo]}. Nothing was saved."
+        install_token_file "$WORK/token.age"
+        CFG[phrase]="$phrase"; save_config
+        info "Phrase verified against the token published in ${CFG[owner]}/${CFG[naat_repo]}."
+        verify_access || true
+    elif [[ -f "$TOKEN_FILE" ]]; then
+        (( rc == 2 )) && warn "could not reach ${CFG[owner]}/${CFG[naat_repo]}; checking against the local encrypted token."
+        age_decrypt "$phrase" "$TOKEN_FILE" >/dev/null \
+            || die "that phrase does not decrypt the local encrypted token ($TOKEN_FILE). Nothing was saved."
+        CFG[phrase]="$phrase"; save_config
+        info "Phrase verified against the local encrypted token."
+    else
+        (( rc == 2 )) && warn "could not reach ${CFG[owner]}/${CFG[naat_repo]} to verify the phrase."
+        if [[ -z "${NAAT_PHRASE:-}" && "$PROMPT_INTERACTIVE" == "1" ]]; then
+            prompt_secret "Repeat secret phrase: "
+            [[ "$REPLY_SECRET" == "$phrase" ]] || die "the phrases do not match. Nothing was saved."
+        fi
+        check_phrase_strength "$phrase"
+        CFG[phrase]="$phrase"; save_config
+        info "Phrase saved. No encrypted banyan token is published yet."
+        info "Next step:  naat update-banyan-token"
+    fi
+    info "Configuration written to $CONFIG_FILE"
+}
+
+verify_access() {
+    local code
+    TOKEN=""; get_token
+    gh_api "application/vnd.github+json" "$(repo_api)" "$WORK/repo.json"; code="$HTTP_CODE"
+    if [[ "$code" == "200" ]]; then
+        info "Access to ${CFG[owner]}/${CFG[tools_repo]} verified."
+    else
+        warn "the token was decrypted, but GitHub answered HTTP $code for ${CFG[owner]}/${CFG[tools_repo]}."
+        return 1
+    fi
+}
+
+configure_list() {
+    local k v
+    printf '%-14s %s\n' "config file" "$CONFIG_FILE$([[ -f "$CONFIG_FILE" ]] || echo '  (not created yet)')"
+    for k in "${CONFIG_KEYS[@]}"; do
+        v="${CFG[$k]}"
+        case "$k" in
+            phrase)      if [[ -n "$v" ]]; then v="******** (set, ${#v} characters)"; else v="(not set - run: naat configure)"; fi ;;
+            scripts_dir) [[ -n "$v" ]] || v="$(scripts_dir)  (default)" ;;
+            editor)      [[ -n "$v" ]] || v="$(pick_editor || echo none)  (auto)" ;;
+        esac
+        printf '%-14s %s\n' "$k" "$v"
+    done
+    if [[ -f "$TOKEN_FILE" ]]; then
+        printf '%-14s %s\n' "banyan token" "encrypted at $TOKEN_FILE (updated $(date -r "$TOKEN_FILE" '+%Y-%m-%d %H:%M'))"
+    else
+        printf '%-14s %s\n' "banyan token" "(no local copy yet)"
+    fi
+    printf '%-14s %s\n' "token source" "$RAW_URL/${CFG[owner]}/${CFG[naat_repo]}/${CFG[naat_branch]}/$TOKEN_REPO_PATH"
+    if ( find_age ) 2>/dev/null; then
+        find_age
+        printf '%-14s %s\n' "encryption" "age $("$AGE_DIR/age" --version 2>/dev/null) ($AGE_DIR)"
+    else
+        printf '%-14s %s\n' "encryption" "bundled age NOT FOUND"
+    fi
+    printf '%-14s %s\n' "naat version" "$NAAT_VERSION"
+}
+
+configure_set() {
+    (( $# == 2 )) || usage_error "usage: naat configure set KEY VALUE"
+    local key="$1" val="$2"
+    [[ "$key" != "phrase" ]] || usage_error "use 'naat configure' to change the phrase."
+    [[ -n "${CFG[$key]+x}" ]] || usage_error "unknown key '$key'. Keys: ${CONFIG_KEYS[*]/phrase/}"
+    [[ "$val" != *$'\n'* ]] || die "the value cannot contain a newline."
+    CFG[$key]="$val"
+    # keep whatever phrase is in the file, not one injected via NAAT_PHRASE
+    CFG[phrase]="$FILE_PHRASE"
+    save_config
+    info "$key=$val"
+}
+
+configure_get() {
+    (( $# == 1 )) || usage_error "usage: naat configure get KEY"
+    [[ "$1" != "phrase" ]] || usage_error "the phrase is not displayed."
+    [[ -n "${CFG[$1]+x}" ]] || usage_error "unknown key '$1'."
+    printf '%s\n' "${CFG[$1]}"
+}
+
+cmd_update_token() {
+    local new="" repo_dir="" verify=1
+    while (( $# )); do
+        case "$1" in
+            --repo)      (( $# >= 2 )) || usage_error "--repo needs a directory."; repo_dir="$2"; shift 2 ;;
+            --no-verify) verify=0; shift ;;
+            -h|--help)   usage; exit 0 ;;
+            -*)          usage_error "unknown option: $1" ;;
+            *)           [[ -z "$new" ]] || usage_error "only one token expected."; new="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "${CFG[phrase]}" ]]; then
+        info "No secret phrase configured yet; choose one now."
+        prompt_secret "Enter secret phrase: ";  local p1="$REPLY_SECRET"
+        [[ -n "$p1" ]] || die "the phrase cannot be empty."
+        if [[ "$PROMPT_INTERACTIVE" == "1" ]]; then
+            prompt_secret "Repeat secret phrase: "
+            [[ "$REPLY_SECRET" == "$p1" ]] || die "the phrases do not match."
+        fi
+        CFG[phrase]="$p1"; save_config
+    fi
+    check_phrase_strength "${CFG[phrase]}"
+
+    if [[ -z "$new" ]]; then
+        prompt_secret "Enter new banyan token: "
+        new="$REPLY_SECRET"
+    fi
+    new="$(printf '%s' "$new" | tr -d '[:space:]')"
+    [[ -n "$new" ]] || die "the token cannot be empty."
+
+    make_work
+    if (( verify )); then
+        need_cmd curl
+        local code
+        code="$(gh_request "$new" "application/vnd.github+json" "$(repo_api)" "$WORK/repo.json")" \
+            || die "could not reach GitHub to verify the token (use --no-verify to skip)."
+        [[ "$code" == "200" ]] \
+            || die "GitHub answered HTTP $code: this token cannot read ${CFG[owner]}/${CFG[tools_repo]}. Nothing was changed. (--no-verify to skip the check)"
+        info "Token verified: it can read ${CFG[owner]}/${CFG[tools_repo]}."
+    fi
+
+    printf '%s\n' "$new" | age_encrypt "${CFG[phrase]}" > "$WORK/new-token.age" \
+        || die "encryption failed."
+    [[ "$(age_decrypt "${CFG[phrase]}" "$WORK/new-token.age")" == "$new" ]] \
+        || die "encryption self-check failed. Nothing was changed."
+    install_token_file "$WORK/new-token.age"
+    TOKEN=""
+    info "Encrypted token saved to $TOKEN_FILE"
+
+    # Publish: drop the file in a checkout of the naat repo, if we have one.
+    if [[ -z "$repo_dir" ]] && command -v git >/dev/null 2>&1; then
+        local top
+        top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        if [[ -n "$top" && -f "$top/install-banyan.sh" && -f "$top/bin/naat" ]]; then repo_dir="$top"; fi
+    fi
+    if [[ -n "$repo_dir" ]]; then
+        [[ -d "$repo_dir" ]] || die "--repo: '$repo_dir' is not a directory."
+        mkdir -p "$repo_dir/credentials"
+        cat "$TOKEN_FILE" > "$repo_dir/$TOKEN_REPO_PATH"
+        info ""
+        info "Updated $repo_dir/$TOKEN_REPO_PATH. Publish it so every server gets it:"
+        info "  cd $repo_dir && git add $TOKEN_REPO_PATH && git commit -m 'Rotate banyan token' && git push"
+    else
+        info ""
+        info "To make it available to every server, commit the text below as"
+        info "'$TOKEN_REPO_PATH' in the ${CFG[owner]}/${CFG[naat_repo]} repository"
+        info "(or run this command inside a clone of it, or with --repo DIR):"
+        info ""
+        cat "$TOKEN_FILE"
+    fi
+}
+
+cmd_sync_token() {
+    require_phrase
+    local rc=0
+    sync_token || rc=$?
+    (( rc != 1 )) || die "no encrypted token published in ${CFG[owner]}/${CFG[naat_repo]} ($TOKEN_REPO_PATH)."
+    (( rc == 0 )) || die "could not download the encrypted token (network?)."
+    age_decrypt "${CFG[phrase]}" "$TOKEN_FILE" >/dev/null \
+        || die "downloaded, but the configured phrase does not decrypt it. Run: naat configure"
+    info "Encrypted token refreshed from ${CFG[owner]}/${CFG[naat_repo]}."
+}
+
+cmd_list() {
+    if [[ "${1:-}" == "local" || "${1:-}" == "--local" ]]; then
+        local d found=0 sd
+        sd="$(scripts_dir)"
+        if [[ -d "$sd" ]]; then
+            for d in "$sd"/*/; do
+                [[ -d "$d" ]] || continue
+                d="${d%/}"
+                [[ -f "$d/${d##*/}.sh" ]] || continue
+                printf '%-24s %s\n' "${d##*/}" "$d/${d##*/}.sh"; found=1
+            done
+        fi
+        (( found )) || info "No downloaded tools in $sd"
+        return 0
+    fi
+    parse_ref_opts "$@"
+    load_tree
+    local p shown=0
+    while IFS= read -r p; do
+        [[ "$p" == *.sh ]] || continue
+        printf '%-24s %s\n' "$(tool_name "$p")" "$p"; shown=1
+    done < "$WORK/tree.txt"
+    (( shown )) || info "No .sh tools found in ${CFG[owner]}/${CFG[tools_repo]} ($REF)."
+    info "(${CFG[owner]}/${CFG[tools_repo]} @ $REF)"
+}
+
+ARGS=()
+parse_ref_opts() {   # extracts --ref R; the rest lands in ARGS
+    ARGS=()
+    while (( $# )); do
+        case "$1" in
+            --ref)   (( $# >= 2 )) || usage_error "--ref needs a value."; OPT_REF="$2"; shift 2 ;;
+            --ref=*) OPT_REF="${1#--ref=}"; shift ;;
+            *)       ARGS+=("$1"); shift ;;
+        esac
+    done
+}
+
+cmd_download() {
+    local name="" edit=1 force=0
+    while (( $# )); do
+        case "$1" in
+            --no-edit)  edit=0; shift ;;
+            --force|-f) force=1; shift ;;
+            --ref)      (( $# >= 2 )) || usage_error "--ref needs a value."; OPT_REF="$2"; shift 2 ;;
+            --ref=*)    OPT_REF="${1#--ref=}"; shift ;;
+            -*)         usage_error "unknown option: $1" ;;
+            *)          [[ -z "$name" ]] || usage_error "only one tool name expected."; name="$1"; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || usage_error "usage: naat download NAME [--no-edit] [--force] [--ref REF]"
+
+    local base dest sd script
+    base="$(tool_name "$name")"
+    sd="$(scripts_dir)"
+    dest="$sd/$base"
+    if [[ -e "$dest" && "$force" == "0" ]]; then
+        die "'$base' is already downloaded in $dest (your local edits live there).
+       Use 'naat run $base' to run it, or 'naat download $base --force' to fetch it
+       again (the current copy is kept as a .bak folder)."
+    fi
+
+    load_tree
+    resolve_tool "$name"
+    info "Downloading $base ..."
+    fetch_tool "$TOOL_PATH" "$WORK/tool"
+    mkdir -p "$sd"
+    chmod 700 "$sd"
+    if [[ -e "$dest" ]]; then
+        local bak
+        bak="$dest.bak-$(date +%Y%m%d-%H%M%S)"
+        mv "$dest" "$bak"
+        info "Previous copy kept in $bak"
+    fi
+    mv "$WORK/tool" "$dest"
+    script="$dest/$base.sh"
+    info "Saved: $script"
+
+    if (( edit )) && [[ -t 0 && -t 1 ]]; then
+        local ed
+        if ed="$(pick_editor)"; then
+            # shellcheck disable=SC2086  # the editor setting may carry arguments
+            $ed "$script" || warn "the editor exited with an error."
+        else
+            warn "no editor found (set one with: naat configure set editor nano)."
+        fi
+    fi
+    info "Run it with: naat run $base"
+}
+
+cmd_execute() {
+    while (( $# )); do
+        case "$1" in
+            --ref)   (( $# >= 2 )) || usage_error "--ref needs a value."; OPT_REF="$2"; shift 2 ;;
+            --ref=*) OPT_REF="${1#--ref=}"; shift ;;
+            --)      shift; break ;;
+            -*)      usage_error "unknown option: $1 (options go before NAME; script arguments after it)" ;;
+            *)       break ;;
+        esac
+    done
+    (( $# >= 1 )) || usage_error "usage: naat execute [--ref REF] NAME [ARGS...]"
+    local name="$1" base script rc=0
+    shift
+    base="$(tool_name "$name")"
+
+    load_tree
+    resolve_tool "$name"
+    info "Fetching $base (temporary copy) ..."
+    fetch_tool "$TOOL_PATH" "$WORK/exec"
+    script="$WORK/exec/$base.sh"
+    info "Executing $base ..."
+    "$script" "$@" || rc=$?
+    cleanup
+    info "Temporary copy of $base removed."
+    exit "$rc"
+}
+
+cmd_run() {
+    (( $# >= 1 )) || usage_error "usage: naat run NAME [ARGS...]"
+    local base script
+    base="$(tool_name "$1")"
+    shift
+    script="$(scripts_dir)/$base/$base.sh"
+    [[ -f "$script" ]] || die "'$base' is not downloaded yet. Run: naat download $base   (or: naat execute $base)"
+    chmod u+x "$script"
+    exec "$script" "$@"
+}
+
+usage() {
+    cat <<EOF
+naat $NAAT_VERSION - toolbox CLI for the tools stored in ${CFG[owner]}/${CFG[tools_repo]}
+
+Usage: naat <command> [arguments]
+
+Setup
+  configure                     Enter the secret phrase (decrypts the banyan token)
+  configure list                Review the configuration
+  configure set KEY VALUE       Change a setting (owner, naat_repo, naat_branch,
+                                tools_repo, ref, scripts_dir, editor)
+  configure get KEY             Print one setting
+  update-banyan-token [TOKEN]   Encrypt a new banyan token with the phrase
+                                (asks for it when omitted; --repo DIR writes it
+                                into a clone of the naat repo; --no-verify)
+  sync-token                    Re-download the encrypted token from the naat repo
+
+Tools
+  list [--ref REF]              Tools available in banyan
+  list local                    Tools already downloaded
+  download NAME [--no-edit] [--force] [--ref REF]
+                                Download a tool and open it in an editor
+  execute [--ref REF] NAME [ARGS...]
+                                Temporary download, run, then remove
+  run NAME [ARGS...]            Run a tool that was already downloaded
+
+Other
+  version                       Print the version
+  help                          This help
+
+ref: 'auto' (default) uses the latest GitHub Release of banyan, or the default
+branch when there is no release yet; 'latest' requires a release; anything
+else is a branch or tag name.
+
+Files: $NAAT_HOME/config, $NAAT_HOME/banyan-token.age, $(scripts_dir)/
+Environment: NAAT_HOME, NAAT_PHRASE (non-interactive use), NAAT_EDITOR
+EOF
+}
+
+main() {
+    load_config
+    local cmd="${1:-help}"
+    (( $# )) && shift
+    case "$cmd" in
+        configure)                         cmd_configure "$@" ;;
+        update-banyan-token|update-token)  cmd_update_token "$@" ;;
+        sync-token)                        cmd_sync_token "$@" ;;
+        list|ls)                           cmd_list "$@" ;;
+        download)                          cmd_download "$@" ;;
+        execute|exec)                      cmd_execute "$@" ;;
+        run)                               cmd_run "$@" ;;
+        version|--version|-V)              echo "naat $NAAT_VERSION" ;;
+        help|--help|-h)                    usage ;;
+        *)                                 usage_error "unknown command: $cmd" ;;
+    esac
+}
+
+main "$@"

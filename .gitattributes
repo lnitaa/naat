@@ -1,0 +1,11 @@
+# Scripts must keep LF line endings even when the repo is edited on Windows.
+*.sh        text eol=lf
+bin/naat    text eol=lf
+*.age       text eol=lf
+*.md        text
+vendor/age/SHA256SUMS text eol=lf
+vendor/age/VERSION    text eol=lf
+vendor/age/LICENSE    text eol=lf
+# Bundled executables and source archive: never touch.
+vendor/age/linux-*/*  binary
+*.tar.gz              binary
