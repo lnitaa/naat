@@ -11,6 +11,7 @@
 #   naat configure                  enter the secret phrase
 #   naat configure list             review the configuration
 #   naat configure aws              install the AWS keys kept in banyan
+#   naat configure github           install the git/GitHub login kept in banyan
 #   naat update-banyan-token TOKEN  encrypt a new banyan token with the phrase
 #   naat list                       tools available in banyan
 #   naat download NAME              download a tool and open it in an editor
@@ -22,13 +23,14 @@
 # =============================================================================
 set -euo pipefail
 
-NAAT_VERSION="0.2.0"
+NAAT_VERSION="0.3.0"
 
 NAAT_HOME="${NAAT_HOME:-$HOME/.naat}"
 CONFIG_FILE="$NAAT_HOME/config"
 TOKEN_FILE="$NAAT_HOME/banyan-token.age"
 TOKEN_REPO_PATH="credentials/banyan-token.age"
-AWS_REPO_DIR="credentials/.aws"          # folder in banyan holding config + credentials
+AWS_REPO_DIR="credentials/.aws"          # banyan folder: config + credentials        -> ~/.aws/
+GITHUB_REPO_DIR="credentials/github"     # banyan folder: .gitconfig + .git-credentials -> ~/
 
 # Overridable for tests / GitHub Enterprise.
 API_URL="${NAAT_API_URL:-https://api.github.com}"
@@ -411,6 +413,7 @@ cmd_configure() {
         "")   configure_phrase ;;
         list) configure_list ;;
         aws)  shift; cmd_configure_aws "$@" ;;
+        github|git) shift; cmd_configure_github "$@" ;;
         set)  shift; configure_set "$@" ;;
         get)  shift; configure_get "$@" ;;
         *)    usage_error "unknown 'configure' sub-command: $1" ;;
@@ -436,8 +439,10 @@ configure_phrase() {
         CFG[phrase]="$phrase"; save_config
         info "Phrase verified against the token published in ${CFG[owner]}/${CFG[naat_repo]}."
         if verify_access; then
-            # New server: set up the AWS CLI keys too (asks before replacing).
-            ( configure_aws auto 0 ) || warn "AWS setup was skipped. Retry with: naat configure aws"
+            # New server: set up the AWS CLI keys and the git/GitHub login too
+            # (asks before replacing anything that is already there).
+            ( configure_aws auto 0; configure_github auto 0 ) \
+                || warn "AWS / GitHub setup did not complete. Retry with: naat configure aws ; naat configure github"
         fi
     elif [[ -f "$TOKEN_FILE" ]]; then
         (( rc == 2 )) && warn "could not reach ${CFG[owner]}/${CFG[naat_repo]}; checking against the local encrypted token."
@@ -490,79 +495,107 @@ aws_key_hint() {   # aws_key_hint FILE -> "AKIA...WXYZ" of the first access key,
     if (( ${#id} > 8 )); then printf '%s...%s' "${id:0:4}" "${id: -4}"; fi
 }
 
-cmd_configure_aws() {
-    local force=0
-    while (( $# )); do
-        case "$1" in
-            --force|-f|--yes|-y) force=1; shift ;;
-            --ref)   (( $# >= 2 )) || usage_error "--ref needs a value."; OPT_REF="$2"; shift 2 ;;
-            --ref=*) OPT_REF="${1#--ref=}"; shift ;;
-            *)       usage_error "usage: naat configure aws [--force] [--ref REF]" ;;
-        esac
-    done
-    configure_aws manual "$force"
+git_cred_hint() {   # git_cred_hint FILE -> "user@host, user2@host2" (passwords never shown)
+    { sed -n 's#^[a-z]*://\([^:@/]*\)[^@]*@\([^/[:space:]]*\).*#\1@\2#p' "$1" 2>/dev/null | head -n 3 | paste -sd, - | sed 's/,/, /g'; } || true
 }
 
-# configure_aws MODE FORCE
-# Copies banyan:credentials/.aws/{config,credentials} to ~/.aws/.
+cred_hint() {   # cred_hint FILE -> short non-secret description of what the file holds
+    case "${1##*/}" in
+        credentials*)      aws_key_hint "$1" ;;
+        .git-credentials*) git_cred_hint "$1" ;;
+    esac
+}
+
+# parse_cred_opts ARGS...  -> sets CRED_FORCE (and OPT_REF)
+CRED_FORCE=0
+parse_cred_opts() {
+    local what="$1"; shift
+    CRED_FORCE=0
+    while (( $# )); do
+        case "$1" in
+            --force|-f|--yes|-y) CRED_FORCE=1; shift ;;
+            --ref)   (( $# >= 2 )) || usage_error "--ref needs a value."; OPT_REF="$2"; shift 2 ;;
+            --ref=*) OPT_REF="${1#--ref=}"; shift ;;
+            *)       usage_error "usage: naat configure $what [--force] [--ref REF]" ;;
+        esac
+    done
+}
+
+cmd_configure_aws()    { parse_cred_opts aws "$@";    configure_aws manual "$CRED_FORCE"; }
+cmd_configure_github() { parse_cred_opts github "$@"; configure_github manual "$CRED_FORCE"; }
+
+# AWS CLI keys:      banyan:credentials/.aws/{config,credentials}            -> ~/.aws/
+configure_aws() {
+    install_credentials "AWS" aws "$AWS_REPO_DIR" "$HOME/.aws" aws "$1" "$2" config credentials
+}
+
+# git / GitHub login: banyan:credentials/github/{.gitconfig,.git-credentials} -> ~/
+configure_github() {
+    install_credentials "GitHub" github "$GITHUB_REPO_DIR" "$HOME" git "$1" "$2" .gitconfig .git-credentials
+}
+
+# install_credentials LABEL SUBCMD REPO_DIR DEST_DIR TOOL MODE FORCE FILE...
+# Copies the listed files from banyan:REPO_DIR to DEST_DIR.
 #   - file missing locally          -> installed, nothing asked
 #   - file identical                -> left alone
 #   - file exists and is different  -> you are told and asked before replacing
 #                                      (a .bak copy is kept); --force = yes
-# MODE auto (called from `naat configure`) stays quiet when banyan has no
-# AWS folder; MODE manual reports it as an error.
-configure_aws() {
-    local mode="$1" force="$2" aws_dir="$HOME/.aws" name src dst rc kept=0 changed=0
+# MODE auto (called from `naat configure`) stays quiet when banyan does not
+# have the folder; MODE manual reports it as an error.
+install_credentials() {
+    local label="$1" subcmd="$2" repo_dir="$3" dest_dir="$4" tool="$5" mode="$6" force="$7"
+    shift 7
+    local name src dst rc kept=0 changed=0 h_old h_new
     local -a names=()
     load_tree
-    for name in config credentials; do
-        if grep -qxF "$AWS_REPO_DIR/$name" "$WORK/tree.txt"; then names+=("$name"); fi
+    for name in "$@"; do
+        if grep -qxF "$repo_dir/$name" "$WORK/tree.txt"; then names+=("$name"); fi
     done
     if (( ${#names[@]} == 0 )); then
         [[ "$mode" == "auto" ]] && return 0
-        die "no $AWS_REPO_DIR/config or $AWS_REPO_DIR/credentials in ${CFG[owner]}/${CFG[tools_repo]} ($REF)."
+        die "nothing to install: $repo_dir/ has none of [$*] in ${CFG[owner]}/${CFG[tools_repo]} ($REF)."
     fi
 
     for name in "${names[@]}"; do
-        src="$WORK/aws/$name"
-        dst="$aws_dir/$name"
-        download_file "$AWS_REPO_DIR/$name" "$src"
+        src="$WORK/cred-$subcmd/$name"
+        dst="$dest_dir/$name"
+        download_file "$repo_dir/$name" "$src"
         if grep -q $'\r$' "$src"; then sed -i 's/\r$//' "$src"; fi
         chmod 600 "$src"
 
         if [[ -e "$dst" ]]; then
             if cmp -s "$src" "$dst"; then
-                info "AWS: $dst is already up to date."
+                info "$label: $dst is already up to date."
                 continue
             fi
-            info "AWS: $dst already exists and is DIFFERENT from the one in ${CFG[tools_repo]}."
-            if [[ "$name" == "credentials" ]]; then
-                info "     current access key: $(aws_key_hint "$dst")   ${CFG[tools_repo]} access key: $(aws_key_hint "$src")"
+            info "$label: $dst already exists and is DIFFERENT from the one in ${CFG[tools_repo]}."
+            h_old="$(cred_hint "$dst")"; h_new="$(cred_hint "$src")"
+            if [[ -n "$h_old$h_new" ]]; then
+                info "     current: ${h_old:-?}   ${CFG[tools_repo]}: ${h_new:-?}"
             fi
             if [[ "$force" != "1" ]]; then
                 rc=0
                 ask_yes_no "     Replace it? (the current file is kept as a .bak copy)" || rc=$?
                 if (( rc == 2 )); then
-                    warn "$dst was NOT replaced (nobody to ask). To replace it: naat configure aws --force"
+                    warn "$dst was NOT replaced (nobody to ask). To replace it: naat configure $subcmd --force"
                     kept=1; continue
                 elif (( rc != 0 )); then
-                    info "AWS: kept your existing $dst."
+                    info "$label: kept your existing $dst."
                     continue
                 fi
             fi
             cp -p "$dst" "$dst.bak-$(date +%Y%m%d-%H%M%S)"
         fi
-        mkdir -p "$aws_dir"
-        chmod 700 "$aws_dir"
+        if [[ ! -d "$dest_dir" ]]; then mkdir -p "$dest_dir"; chmod 700 "$dest_dir"; fi
         ( umask 077; cat "$src" > "$dst.tmp.$$" )
         mv -f "$dst.tmp.$$" "$dst"
         chmod 600 "$dst"
         changed=1
-        info "AWS: installed $dst (from ${CFG[owner]}/${CFG[tools_repo]}@$REF)."
+        info "$label: installed $dst (from ${CFG[owner]}/${CFG[tools_repo]}@$REF)."
     done
 
-    if (( changed )) && ! command -v aws >/dev/null 2>&1; then
-        warn "the keys are in place, but the 'aws' command is not installed on this machine."
+    if (( changed )) && ! command -v "$tool" >/dev/null 2>&1; then
+        warn "the $label files are in place, but the '$tool' command is not installed on this machine."
     fi
     if (( kept )) && [[ "$mode" == "manual" ]]; then return 1; fi
     return 0
@@ -588,9 +621,16 @@ configure_list() {
     local awsf
     for awsf in credentials config; do
         if [[ -f "$HOME/.aws/$awsf" ]]; then
-            printf '%-14s %s\n' "aws $awsf" "$HOME/.aws/$awsf$([[ "$awsf" == credentials ]] && printf '  (key %s)' "$(aws_key_hint "$HOME/.aws/$awsf")")"
+            printf '%-14s %s\n' "$([[ "$awsf" == credentials ]] && echo "aws keys" || echo "aws config")" "$HOME/.aws/$awsf$([[ "$awsf" == credentials ]] && printf '  (key %s)' "$(aws_key_hint "$HOME/.aws/$awsf")")"
         else
-            printf '%-14s %s\n' "aws $awsf" "(not present - run: naat configure aws)"
+            printf '%-14s %s\n' "$([[ "$awsf" == credentials ]] && echo "aws keys" || echo "aws config")" "(not present - run: naat configure aws)"
+        fi
+    done
+    for awsf in .git-credentials .gitconfig; do
+        if [[ -f "$HOME/$awsf" ]]; then
+            printf '%-14s %s\n' "$([[ "$awsf" == .git-credentials ]] && echo "git login" || echo "git config")" "$HOME/$awsf$([[ "$awsf" == .git-credentials ]] && printf '  (%s)' "$(git_cred_hint "$HOME/$awsf")")"
+        else
+            printf '%-14s %s\n' "$([[ "$awsf" == .git-credentials ]] && echo "git login" || echo "git config")" "(not present - run: naat configure github)"
         fi
     done
     printf '%-14s %s\n' "token source" "$RAW_URL/${CFG[owner]}/${CFG[naat_repo]}/${CFG[naat_branch]}/$TOKEN_REPO_PATH"
@@ -848,6 +888,8 @@ Setup
                                 ($AWS_REPO_DIR) into ~/.aws. Done automatically by
                                 'configure' on a new server; when ~/.aws already
                                 has different files you are asked before replacing
+  configure github [--force]    Same for the git/GitHub login kept in banyan
+                                ($GITHUB_REPO_DIR): ~/.gitconfig, ~/.git-credentials
   configure set KEY VALUE       Change a setting (owner, naat_repo, naat_branch,
                                 tools_repo, ref, scripts_dir, editor)
   configure get KEY             Print one setting

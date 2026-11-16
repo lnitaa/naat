@@ -50,6 +50,7 @@ The phrase is checked against the published token and saved in `~/.naat/config`
 | `naat execute s3_restore [args]` | Temporary download, run, remove automatically |
 | `naat configure list` | Review the configuration (phrase is masked) |
 | `naat configure aws` | Installs the AWS CLI keys kept in banyan (`credentials/.aws/`) into `~/.aws/` |
+| `naat configure github` | Installs the git/GitHub login kept in banyan (`credentials/github/`) as `~/.gitconfig` and `~/.git-credentials` |
 | `naat configure set KEY VALUE` | Change `owner`, `naat_repo`, `naat_branch`, `tools_repo`, `ref`, `scripts_dir`, `editor` |
 | `naat update-banyan-token [TOKEN]` | Encrypt a new token with the phrase (rotation) |
 | `naat sync-token` | Re-download the encrypted token from this repo |
@@ -77,6 +78,10 @@ Details:
   (with both access key ids) and asked before it is replaced; the old file is
   kept as `.bak-<date>`. Without a terminal nothing is replaced unless you run
   `naat configure aws --force`.
+- **git / GitHub login:** handled exactly like the AWS keys. `naat configure`
+  copies banyan's `credentials/github/.gitconfig` and `.git-credentials` to your
+  home folder; an existing different file is shown (user and host only, never
+  the password) and you are asked before it is replaced.
 - Configuration is per Linux user. If a tool needs root, configure root too
   (`sudo naat configure`) and use `sudo naat execute ...`.
 
