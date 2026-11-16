@@ -10,6 +10,7 @@
 #
 #   naat configure                  enter the secret phrase
 #   naat configure list             review the configuration
+#   naat configure aws              install the AWS keys kept in banyan
 #   naat update-banyan-token TOKEN  encrypt a new banyan token with the phrase
 #   naat list                       tools available in banyan
 #   naat download NAME              download a tool and open it in an editor
@@ -21,12 +22,13 @@
 # =============================================================================
 set -euo pipefail
 
-NAAT_VERSION="0.1.0"
+NAAT_VERSION="0.2.0"
 
 NAAT_HOME="${NAAT_HOME:-$HOME/.naat}"
 CONFIG_FILE="$NAAT_HOME/config"
 TOKEN_FILE="$NAAT_HOME/banyan-token.age"
 TOKEN_REPO_PATH="credentials/banyan-token.age"
+AWS_REPO_DIR="credentials/.aws"          # folder in banyan holding config + credentials
 
 # Overridable for tests / GitHub Enterprise.
 API_URL="${NAAT_API_URL:-https://api.github.com}"
@@ -408,6 +410,7 @@ cmd_configure() {
     case "${1:-}" in
         "")   configure_phrase ;;
         list) configure_list ;;
+        aws)  shift; cmd_configure_aws "$@" ;;
         set)  shift; configure_set "$@" ;;
         get)  shift; configure_get "$@" ;;
         *)    usage_error "unknown 'configure' sub-command: $1" ;;
@@ -432,7 +435,10 @@ configure_phrase() {
         install_token_file "$WORK/token.age"
         CFG[phrase]="$phrase"; save_config
         info "Phrase verified against the token published in ${CFG[owner]}/${CFG[naat_repo]}."
-        verify_access || true
+        if verify_access; then
+            # New server: set up the AWS CLI keys too (asks before replacing).
+            ( configure_aws auto 0 ) || warn "AWS setup was skipped. Retry with: naat configure aws"
+        fi
     elif [[ -f "$TOKEN_FILE" ]]; then
         (( rc == 2 )) && warn "could not reach ${CFG[owner]}/${CFG[naat_repo]}; checking against the local encrypted token."
         age_decrypt "$phrase" "$TOKEN_FILE" >/dev/null \
@@ -465,6 +471,103 @@ verify_access() {
     fi
 }
 
+# ask_yes_no "Question"  -> 0 yes, 1 no, 2 nobody to ask (not interactive)
+ask_yes_no() {
+    local ans=""
+    if [[ -t 0 ]]; then
+        read -r -p "$1 [y/N] " ans || true
+    elif [[ -r /dev/tty && -w /dev/tty ]] && { : < /dev/tty; } 2>/dev/null; then
+        read -r -p "$1 [y/N] " ans < /dev/tty || true
+    else
+        return 2
+    fi
+    case "$ans" in y|Y|yes|YES|Yes|s|S|si|SI|Si) return 0 ;; *) return 1 ;; esac
+}
+
+aws_key_hint() {   # aws_key_hint FILE -> "AKIA...WXYZ" of the first access key, or nothing
+    local id
+    id="$(sed -n 's/^[[:space:]]*aws_access_key_id[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\1/p' "$1" 2>/dev/null | head -n 1)" || true
+    if (( ${#id} > 8 )); then printf '%s...%s' "${id:0:4}" "${id: -4}"; fi
+}
+
+cmd_configure_aws() {
+    local force=0
+    while (( $# )); do
+        case "$1" in
+            --force|-f|--yes|-y) force=1; shift ;;
+            --ref)   (( $# >= 2 )) || usage_error "--ref needs a value."; OPT_REF="$2"; shift 2 ;;
+            --ref=*) OPT_REF="${1#--ref=}"; shift ;;
+            *)       usage_error "usage: naat configure aws [--force] [--ref REF]" ;;
+        esac
+    done
+    configure_aws manual "$force"
+}
+
+# configure_aws MODE FORCE
+# Copies banyan:credentials/.aws/{config,credentials} to ~/.aws/.
+#   - file missing locally          -> installed, nothing asked
+#   - file identical                -> left alone
+#   - file exists and is different  -> you are told and asked before replacing
+#                                      (a .bak copy is kept); --force = yes
+# MODE auto (called from `naat configure`) stays quiet when banyan has no
+# AWS folder; MODE manual reports it as an error.
+configure_aws() {
+    local mode="$1" force="$2" aws_dir="$HOME/.aws" name src dst rc kept=0 changed=0
+    local -a names=()
+    load_tree
+    for name in config credentials; do
+        if grep -qxF "$AWS_REPO_DIR/$name" "$WORK/tree.txt"; then names+=("$name"); fi
+    done
+    if (( ${#names[@]} == 0 )); then
+        [[ "$mode" == "auto" ]] && return 0
+        die "no $AWS_REPO_DIR/config or $AWS_REPO_DIR/credentials in ${CFG[owner]}/${CFG[tools_repo]} ($REF)."
+    fi
+
+    for name in "${names[@]}"; do
+        src="$WORK/aws/$name"
+        dst="$aws_dir/$name"
+        download_file "$AWS_REPO_DIR/$name" "$src"
+        if grep -q $'\r$' "$src"; then sed -i 's/\r$//' "$src"; fi
+        chmod 600 "$src"
+
+        if [[ -e "$dst" ]]; then
+            if cmp -s "$src" "$dst"; then
+                info "AWS: $dst is already up to date."
+                continue
+            fi
+            info "AWS: $dst already exists and is DIFFERENT from the one in ${CFG[tools_repo]}."
+            if [[ "$name" == "credentials" ]]; then
+                info "     current access key: $(aws_key_hint "$dst")   ${CFG[tools_repo]} access key: $(aws_key_hint "$src")"
+            fi
+            if [[ "$force" != "1" ]]; then
+                rc=0
+                ask_yes_no "     Replace it? (the current file is kept as a .bak copy)" || rc=$?
+                if (( rc == 2 )); then
+                    warn "$dst was NOT replaced (nobody to ask). To replace it: naat configure aws --force"
+                    kept=1; continue
+                elif (( rc != 0 )); then
+                    info "AWS: kept your existing $dst."
+                    continue
+                fi
+            fi
+            cp -p "$dst" "$dst.bak-$(date +%Y%m%d-%H%M%S)"
+        fi
+        mkdir -p "$aws_dir"
+        chmod 700 "$aws_dir"
+        ( umask 077; cat "$src" > "$dst.tmp.$$" )
+        mv -f "$dst.tmp.$$" "$dst"
+        chmod 600 "$dst"
+        changed=1
+        info "AWS: installed $dst (from ${CFG[owner]}/${CFG[tools_repo]}@$REF)."
+    done
+
+    if (( changed )) && ! command -v aws >/dev/null 2>&1; then
+        warn "the keys are in place, but the 'aws' command is not installed on this machine."
+    fi
+    if (( kept )) && [[ "$mode" == "manual" ]]; then return 1; fi
+    return 0
+}
+
 configure_list() {
     local k v
     printf '%-14s %s\n' "config file" "$CONFIG_FILE$([[ -f "$CONFIG_FILE" ]] || echo '  (not created yet)')"
@@ -482,6 +585,14 @@ configure_list() {
     else
         printf '%-14s %s\n' "banyan token" "(no local copy yet)"
     fi
+    local awsf
+    for awsf in credentials config; do
+        if [[ -f "$HOME/.aws/$awsf" ]]; then
+            printf '%-14s %s\n' "aws $awsf" "$HOME/.aws/$awsf$([[ "$awsf" == credentials ]] && printf '  (key %s)' "$(aws_key_hint "$HOME/.aws/$awsf")")"
+        else
+            printf '%-14s %s\n' "aws $awsf" "(not present - run: naat configure aws)"
+        fi
+    done
     printf '%-14s %s\n' "token source" "$RAW_URL/${CFG[owner]}/${CFG[naat_repo]}/${CFG[naat_branch]}/$TOKEN_REPO_PATH"
     if ( find_age ) 2>/dev/null; then
         find_age
@@ -733,6 +844,10 @@ Usage: naat <command> [arguments]
 Setup
   configure                     Enter the secret phrase (decrypts the banyan token)
   configure list                Review the configuration
+  configure aws [--force]       Install the AWS CLI keys kept in banyan
+                                ($AWS_REPO_DIR) into ~/.aws. Done automatically by
+                                'configure' on a new server; when ~/.aws already
+                                has different files you are asked before replacing
   configure set KEY VALUE       Change a setting (owner, naat_repo, naat_branch,
                                 tools_repo, ref, scripts_dir, editor)
   configure get KEY             Print one setting

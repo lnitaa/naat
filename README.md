@@ -49,6 +49,7 @@ The phrase is checked against the published token and saved in `~/.naat/config`
 | `naat run s3_restore [args]` | Runs the copy that was already downloaded (with your edits) |
 | `naat execute s3_restore [args]` | Temporary download, run, remove automatically |
 | `naat configure list` | Review the configuration (phrase is masked) |
+| `naat configure aws` | Installs the AWS CLI keys kept in banyan (`credentials/.aws/`) into `~/.aws/` |
 | `naat configure set KEY VALUE` | Change `owner`, `naat_repo`, `naat_branch`, `tools_repo`, `ref`, `scripts_dir`, `editor` |
 | `naat update-banyan-token [TOKEN]` | Encrypt a new token with the phrase (rotation) |
 | `naat sync-token` | Re-download the encrypted token from this repo |
@@ -70,6 +71,12 @@ Details:
   repo and push. Servers pick the new token up automatically the next time
   GitHub rejects the old one. Prefer omitting the token on the command line
   (it is asked with hidden input) so it does not end up in shell history.
+- **AWS keys:** on a new server `naat configure` also copies banyan's
+  `credentials/.aws/config` and `credentials/.aws/credentials` to `~/.aws/`, with
+  nothing to type. If `~/.aws` already has a *different* file you are told
+  (with both access key ids) and asked before it is replaced; the old file is
+  kept as `.bak-<date>`. Without a terminal nothing is replaced unless you run
+  `naat configure aws --force`.
 - Configuration is per Linux user. If a tool needs root, configure root too
   (`sudo naat configure`) and use `sudo naat execute ...`.
 
