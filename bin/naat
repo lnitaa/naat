@@ -23,7 +23,7 @@
 # =============================================================================
 set -euo pipefail
 
-NAAT_VERSION="0.3.0"
+NAAT_VERSION="0.4.0"
 
 NAAT_HOME="${NAAT_HOME:-$HOME/.naat}"
 CONFIG_FILE="$NAAT_HOME/config"
@@ -31,6 +31,7 @@ TOKEN_FILE="$NAAT_HOME/banyan-token.age"
 TOKEN_REPO_PATH="credentials/banyan-token.age"
 AWS_REPO_DIR="credentials/.aws"          # banyan folder: config + credentials        -> ~/.aws/
 GITHUB_REPO_DIR="credentials/github"     # banyan folder: .gitconfig + .git-credentials -> ~/
+REPOS_CONF="repos.conf"                  # in that folder: folders to turn into git checkouts
 
 # Overridable for tests / GitHub Enterprise.
 API_URL="${NAAT_API_URL:-https://api.github.com}"
@@ -530,8 +531,192 @@ configure_aws() {
 }
 
 # git / GitHub login: banyan:credentials/github/{.gitconfig,.git-credentials} -> ~/
+# Then prepares the folders listed in banyan:credentials/github/repos.conf.
 configure_github() {
-    install_credentials "GitHub" github "$GITHUB_REPO_DIR" "$HOME" git "$1" "$2" .gitconfig .git-credentials
+    local rc=0
+    install_credentials "GitHub" github "$GITHUB_REPO_DIR" "$HOME" git "$1" "$2" .git-credentials || rc=$?
+    merge_gitconfig "$2" || rc=1
+    setup_git_repos "$2" || rc=1
+    return "$rc"
+}
+
+# merge_gitconfig FORCE
+# banyan:credentials/github/.gitconfig -> ~/.gitconfig, setting by setting, so
+# what the machine already has (user.name, safe.directory, aliases...) is kept.
+# A setting that exists with another value is shown and asked about.
+merge_gitconfig() {
+    local force="$1" src dst="$HOME/.gitconfig" kv key val cur rc kept=0 added=0
+    load_tree
+    grep -qxF "$GITHUB_REPO_DIR/.gitconfig" "$WORK/tree.txt" || return 0
+    src="$WORK/cred-github/.gitconfig"
+    download_file "$GITHUB_REPO_DIR/.gitconfig" "$src"
+    if grep -q $'\r$' "$src"; then sed -i 's/\r$//' "$src"; fi
+
+    if [[ ! -e "$dst" ]]; then
+        cat "$src" > "$dst"
+        chmod 644 "$dst"
+        info "GitHub: installed $dst (from ${CFG[owner]}/${CFG[tools_repo]}@$REF)."
+        return 0
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        warn "'git' is not installed; $dst was left as it is."
+        return 0
+    fi
+    while IFS= read -r -u 3 kv; do
+        [[ "$kv" == *=* ]] || continue
+        key="${kv%%=*}"; val="${kv#*=}"
+        if cur="$(git config --global --get "$key" 2>/dev/null)"; then
+            [[ "$cur" == "$val" ]] && continue
+            info "GitHub: git setting '$key' already exists with a DIFFERENT value."
+            info "     current: $cur   ${CFG[tools_repo]}: $val"
+            rc=0
+            if [[ "$force" != "1" ]]; then
+                ask_yes_no "     Change it?" || rc=$?
+            fi
+            if (( rc == 2 )); then
+                warn "'$key' was NOT changed (nobody to ask). To change it: naat configure github --force"
+                kept=1; continue
+            elif (( rc != 0 )); then
+                info "GitHub: kept $key = $cur"
+                continue
+            fi
+        fi
+        git config --global "$key" "$val" || { warn "could not set git setting $key."; continue; }
+        added=1
+        info "GitHub: git setting $key = $val"
+    done 3< <(git config -f "$src" --list 2>/dev/null)
+    (( added || kept )) || info "GitHub: $dst already has the settings from ${CFG[tools_repo]}."
+    (( kept )) && return 1
+    return 0
+}
+
+trim() {
+    local t="$1"
+    t="${t#"${t%%[![:space:]]*}"}"
+    t="${t%"${t##*[![:space:]]}"}"
+    printf '%s' "$t"
+}
+
+mask_url() { printf '%s' "$1" | sed 's#://[^@/]*@#://***@#'; }
+
+# setup_git_repos FORCE
+# Reads banyan:credentials/github/repos.conf, one folder per line:
+#     /absolute/folder | https://github.com/ORG/REPO.git | branch(optional)
+# and makes each folder that exists on this machine a working git checkout.
+setup_git_repos() {
+    local force="$1" conf line path url branch rc=0
+    load_tree
+    grep -qxF "$GITHUB_REPO_DIR/$REPOS_CONF" "$WORK/tree.txt" || return 0
+    conf="$WORK/cred-github/$REPOS_CONF"
+    download_file "$GITHUB_REPO_DIR/$REPOS_CONF" "$conf"
+    if ! command -v git >/dev/null 2>&1; then
+        warn "'git' is not installed; the folders in $REPOS_CONF were not prepared."
+        return 1
+    fi
+    while IFS= read -r -u 3 line || [[ -n "$line" ]]; do
+        line="$(trim "${line%$'\r'}")"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        IFS='|' read -r path url branch <<< "$line"
+        path="$(trim "$path")"; url="$(trim "$url")"; branch="$(trim "${branch:-}")"
+        if [[ "$path" != /* || -z "$url" ]]; then
+            warn "$REPOS_CONF: line ignored (expected: /folder | url | branch): $line"
+            continue
+        fi
+        setup_one_repo "${path%/}" "$url" "$branch" "$force" || rc=1
+    done 3< "$conf"
+    return "$rc"
+}
+
+# setup_one_repo DIR URL BRANCH FORCE
+#   1. marks DIR as git "safe.directory" (fixes "detected dubious ownership")
+#   2. git init when DIR is not a repository yet
+#   3. adds the remote "origin" (asks before changing a different one)
+#   4. for a repository it just created: fetches and attaches the branch to
+#      origin WITHOUT touching the files already in the folder
+setup_one_repo() {
+    local dir="$1" url="$2" branch="$3" force="$4"
+    local owner cur scope="--global" fresh=0 empty=0 rc
+    if [[ ! -d "$dir" ]]; then
+        info "Git: $dir does not exist on this machine; skipped."
+        return 0
+    fi
+    owner="$(stat -c %U "$dir" 2>/dev/null || echo '?')"
+
+    [[ "$(id -u)" == "0" ]] && scope="--system"
+    if ! git config "$scope" --get-all safe.directory 2>/dev/null | grep -qxF "$dir"; then
+        if git config "$scope" --add safe.directory "$dir"; then
+            info "Git: $dir registered as safe.directory ($([[ "$scope" == --system ]] && echo 'all users' || echo "user $(id -un)"))."
+        fi
+    fi
+
+    if [[ ! -e "$dir/.git" ]]; then
+        if [[ ! -w "$dir" ]]; then
+            warn "$dir is not a git repository and $(id -un) cannot write in it (owner: $owner). Run: sudo naat configure github"
+            return 1
+        fi
+        [[ -z "$(ls -A "$dir")" ]] && empty=1
+        git -C "$dir" init -q || { warn "git init failed in $dir."; return 1; }
+        fresh=1
+        info "Git: initialized a repository in $dir"
+    fi
+
+    cur="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+    if [[ -z "$cur" ]]; then
+        git -C "$dir" remote add origin "$url" || { warn "could not add the remote in $dir (permissions? try with sudo)."; return 1; }
+        info "Git: $dir remote 'origin' -> $url"
+    elif [[ "$cur" == "$url" ]]; then
+        info "Git: $dir remote 'origin' is already $url"
+    else
+        info "Git: $dir already has a DIFFERENT remote 'origin'."
+        info "     current: $(mask_url "$cur")   ${CFG[tools_repo]}: $url"
+        rc=0
+        if [[ "$force" != "1" ]]; then
+            ask_yes_no "     Change it?" || rc=$?
+        fi
+        if (( rc == 0 )); then
+            git -C "$dir" remote set-url origin "$url" || return 1
+            info "Git: $dir remote 'origin' -> $url"
+        elif (( rc == 2 )); then
+            warn "the remote of $dir was NOT changed (nobody to ask). To change it: naat configure github --force"
+        else
+            info "Git: kept the existing remote of $dir."
+        fi
+    fi
+
+    if (( fresh )); then
+        if git -C "$dir" fetch -q origin; then
+            if [[ -z "$branch" ]]; then
+                git -C "$dir" remote set-head origin -a >/dev/null 2>&1 || true
+                branch="$(git -C "$dir" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+                branch="${branch#origin/}"
+            fi
+            if [[ -n "$branch" ]] && git -C "$dir" rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null 2>&1; then
+                git -C "$dir" update-ref "refs/heads/$branch" "refs/remotes/origin/$branch"
+                git -C "$dir" symbolic-ref HEAD "refs/heads/$branch"
+                git -C "$dir" config "branch.$branch.remote" origin
+                git -C "$dir" config "branch.$branch.merge" "refs/heads/$branch"
+                if (( empty )); then
+                    git -C "$dir" reset -q --hard
+                    info "Git: $dir checked out at origin/$branch."
+                else
+                    git -C "$dir" reset -q
+                    info "Git: $dir attached to origin/$branch. The files already in the folder were NOT"
+                    info "     touched; 'git -C $dir status' shows how they differ from the remote."
+                fi
+            else
+                warn "branch '${branch:-?}' was not found in $url; $dir has the remote but no branch yet."
+            fi
+        else
+            warn "'git fetch' failed for $dir (credentials or URL?). The repository and remote are set; retry: git -C $dir fetch origin"
+        fi
+    fi
+
+    # Created as root inside somebody else's folder: hand the new files over.
+    if (( fresh )) && [[ "$(id -u)" == "0" && "$owner" != "root" && "$owner" != "?" ]]; then
+        if (( empty )); then chown -R --reference="$dir" "$dir"
+        else chown -R --reference="$dir" "$dir/.git"; fi
+    fi
+    return 0
 }
 
 # install_credentials LABEL SUBCMD REPO_DIR DEST_DIR TOOL MODE FORCE FILE...
@@ -889,7 +1074,9 @@ Setup
                                 'configure' on a new server; when ~/.aws already
                                 has different files you are asked before replacing
   configure github [--force]    Same for the git/GitHub login kept in banyan
-                                ($GITHUB_REPO_DIR): ~/.gitconfig, ~/.git-credentials
+                                ($GITHUB_REPO_DIR): ~/.gitconfig, ~/.git-credentials.
+                                Also prepares the folders listed in its repos.conf:
+                                safe.directory, git init, remote origin
   configure set KEY VALUE       Change a setting (owner, naat_repo, naat_branch,
                                 tools_repo, ref, scripts_dir, editor)
   configure get KEY             Print one setting

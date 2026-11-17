@@ -78,10 +78,19 @@ Details:
   (with both access key ids) and asked before it is replaced; the old file is
   kept as `.bak-<date>`. Without a terminal nothing is replaced unless you run
   `naat configure aws --force`.
-- **git / GitHub login:** handled exactly like the AWS keys. `naat configure`
-  copies banyan's `credentials/github/.gitconfig` and `.git-credentials` to your
-  home folder; an existing different file is shown (user and host only, never
-  the password) and you are asked before it is replaced.
+- **git / GitHub login:** `naat configure` (or `naat configure github`) installs
+  banyan's `credentials/github/.git-credentials` like the AWS keys (an existing
+  different file is shown - user and host only - and you are asked before it is
+  replaced). The settings in banyan's `.gitconfig` are merged into `~/.gitconfig`
+  one by one, so what the server already has is kept; a setting with another
+  value is shown and asked about.
+- **Code folders:** every folder listed in banyan's `credentials/github/repos.conf`
+  (`/folder | url | branch`) that exists on the server is registered as git
+  `safe.directory` (fixes "detected dubious ownership"), gets `git init` if it is
+  not a repository yet and the remote `origin`. A folder that already has files
+  is attached to the remote branch without touching them. Use
+  `sudo naat configure github` when the folder belongs to another user: it is
+  then registered for all users and the new `.git` is handed to the folder owner.
 - Configuration is per Linux user. If a tool needs root, configure root too
   (`sudo naat configure`) and use `sudo naat execute ...`.
 
