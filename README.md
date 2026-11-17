@@ -92,8 +92,11 @@ Details:
   not exist is created with `git clone` (only if its parent folder exists). Use
   `sudo naat configure github` when the folder belongs to another user: it is
   then registered for all users and the new `.git` is handed to the folder owner.
-- Configuration is per Linux user. If a tool needs root, configure root too
-  (`sudo naat configure`) and use `sudo naat execute ...`.
+- **sudo:** configuration is per Linux user, and `sudo naat ...` runs as root.
+  If root was never configured, naat reuses the configuration (phrase
+  included) of the user who ran sudo, so `naat configure` once is enough.
+  `sudo naat configure` gives root its own. Files are still installed for the
+  user the command runs as: `sudo naat configure aws` writes root's `~/.aws`.
 
 ## Automation / future UI
 

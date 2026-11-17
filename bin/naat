@@ -23,7 +23,7 @@
 # =============================================================================
 set -euo pipefail
 
-NAAT_VERSION="0.5.0"
+NAAT_VERSION="0.6.0"
 
 NAAT_HOME="${NAAT_HOME:-$HOME/.naat}"
 CONFIG_FILE="$NAAT_HOME/config"
@@ -48,6 +48,16 @@ declare -A CFG=(
     [editor]=""             # empty = $VISUAL / $EDITOR / nano / vim / vi
     [phrase]=""
 )
+
+# How the user called us: hints printed in messages must say "sudo naat ..."
+# when running under sudo, because root has its own configuration.
+SELF="naat"
+SUDO_FROM=""        # user who ran sudo (empty when not under sudo)
+if [[ "$(id -u)" == "0" && -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]]; then
+    SELF="sudo naat"
+    SUDO_FROM="$SUDO_USER"
+fi
+CONFIG_SOURCE=""    # file the configuration was actually read from
 
 TOKEN=""
 FILE_PHRASE=""
@@ -91,15 +101,31 @@ scripts_dir() {
 # ----------------------------------------------------------------------------
 # configuration file (plain key=value, never sourced)
 # ----------------------------------------------------------------------------
+read_config_file() {
+    local line key
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
+        key="${line%%=*}"
+        if [[ -n "${CFG[$key]+x}" ]]; then CFG[$key]="${line#*=}"; fi
+    done < "$1"
+}
+
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
-        local line key
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            line="${line%$'\r'}"
-            [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
-            key="${line%%=*}"
-            if [[ -n "${CFG[$key]+x}" ]]; then CFG[$key]="${line#*=}"; fi
-        done < "$CONFIG_FILE"
+        read_config_file "$CONFIG_FILE"
+        CONFIG_SOURCE="$CONFIG_FILE"
+    elif [[ -n "$SUDO_FROM" ]]; then
+        # `sudo naat ...` and root was never configured: reuse the configuration
+        # (phrase included) of the user who ran sudo, so the phrase is typed once.
+        local uhome
+        uhome="$(getent passwd "$SUDO_FROM" 2>/dev/null | cut -d: -f6)" || true
+        if [[ -n "$uhome" && -f "$uhome/.naat/config" ]]; then
+            read_config_file "$uhome/.naat/config"
+            CONFIG_SOURCE="$uhome/.naat/config"
+            # scripts_dir of that user stays theirs; root keeps its own default
+            CFG[scripts_dir]=""
+        fi
     fi
     FILE_PHRASE="${CFG[phrase]}"
     # Automation / future UI can inject the phrase without a config file.
@@ -185,7 +211,13 @@ check_phrase_strength() {
 }
 
 require_phrase() {
-    [[ -n "${CFG[phrase]}" ]] || die "no secret phrase configured. Run: naat configure"
+    [[ -n "${CFG[phrase]}" ]] && return 0
+    if [[ -n "$SUDO_FROM" ]]; then
+        die "no secret phrase configured for root, nor for user '$SUDO_FROM'.
+       Commands run with sudo use root's configuration. Run: sudo naat configure
+       (or 'naat configure' as $SUDO_FROM: sudo then reuses that phrase)"
+    fi
+    die "no secret phrase configured. Run: naat configure"
 }
 
 # ----------------------------------------------------------------------------
@@ -230,15 +262,15 @@ get_token() {
         local rc=0
         sync_token || rc=$?
         if (( rc == 1 )); then
-            die "no encrypted token published yet in ${CFG[owner]}/${CFG[naat_repo]} ($TOKEN_REPO_PATH). Run: naat update-banyan-token"
+            die "no encrypted token published yet in ${CFG[owner]}/${CFG[naat_repo]} ($TOKEN_REPO_PATH). Run: $SELF update-banyan-token"
         elif (( rc != 0 )); then
             die "could not download the encrypted token from ${CFG[owner]}/${CFG[naat_repo]} (network?)."
         fi
     fi
     TOKEN="$(age_decrypt "${CFG[phrase]}" "$TOKEN_FILE")" \
-        || die "the secret phrase does not decrypt the banyan token. Run: naat configure"
+        || die "the secret phrase does not decrypt the banyan token. Run: $SELF configure"
     TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
-    [[ -n "$TOKEN" ]] || die "the decrypted banyan token is empty. Run: naat update-banyan-token"
+    [[ -n "$TOKEN" ]] || die "the decrypted banyan token is empty. Run: $SELF update-banyan-token"
 }
 
 # ----------------------------------------------------------------------------
@@ -280,7 +312,7 @@ gh_api() {
 
 api_fail() {   # api_fail CODE WHAT
     case "$1" in
-        401) die "GitHub rejected the banyan token (expired or revoked). Create a new one and run: naat update-banyan-token" ;;
+        401) die "GitHub rejected the banyan token (expired or revoked). Create a new one and run: $SELF update-banyan-token" ;;
         403) die "GitHub denied access while $2 (token permissions or rate limit)." ;;
         404) die "not found while $2. Check that the token can read ${CFG[owner]}/${CFG[tools_repo]}." ;;
         409) die "the repository ${CFG[owner]}/${CFG[tools_repo]} is empty." ;;
@@ -443,7 +475,7 @@ configure_phrase() {
             # New server: set up the AWS CLI keys and the git/GitHub login too
             # (asks before replacing anything that is already there).
             ( configure_aws auto 0; configure_github auto 0 ) \
-                || warn "AWS / GitHub setup did not complete. Retry with: naat configure aws ; naat configure github"
+                || warn "AWS / GitHub setup did not complete. Retry with: $SELF configure aws ; $SELF configure github"
         fi
     elif [[ -f "$TOKEN_FILE" ]]; then
         (( rc == 2 )) && warn "could not reach ${CFG[owner]}/${CFG[naat_repo]}; checking against the local encrypted token."
@@ -460,7 +492,7 @@ configure_phrase() {
         check_phrase_strength "$phrase"
         CFG[phrase]="$phrase"; save_config
         info "Phrase saved. No encrypted banyan token is published yet."
-        info "Next step:  naat update-banyan-token"
+        info "Next step:  $SELF update-banyan-token"
     fi
     info "Configuration written to $CONFIG_FILE"
 }
@@ -574,7 +606,7 @@ merge_gitconfig() {
                 ask_yes_no "     Change it?" || rc=$?
             fi
             if (( rc == 2 )); then
-                warn "'$key' was NOT changed (nobody to ask). To change it: naat configure github --force"
+                warn "'$key' was NOT changed (nobody to ask). To change it: $SELF configure github --force"
                 kept=1; continue
             elif (( rc != 0 )); then
                 info "GitHub: kept $key = $cur"
@@ -715,7 +747,7 @@ setup_one_repo() {
             git -C "$dir" remote set-url origin "$url" || return 1
             info "Git: $dir remote 'origin' -> $url"
         elif (( rc == 2 )); then
-            warn "the remote of $dir was NOT changed (nobody to ask). To change it: naat configure github --force"
+            warn "the remote of $dir was NOT changed (nobody to ask). To change it: $SELF configure github --force"
         else
             info "Git: kept the existing remote of $dir."
         fi
@@ -800,7 +832,7 @@ install_credentials() {
                 rc=0
                 ask_yes_no "     Replace it? (the current file is kept as a .bak copy)" || rc=$?
                 if (( rc == 2 )); then
-                    warn "$dst was NOT replaced (nobody to ask). To replace it: naat configure $subcmd --force"
+                    warn "$dst was NOT replaced (nobody to ask). To replace it: $SELF configure $subcmd --force"
                     kept=1; continue
                 elif (( rc != 0 )); then
                     info "$label: kept your existing $dst."
@@ -826,11 +858,15 @@ install_credentials() {
 
 configure_list() {
     local k v
-    printf '%-14s %s\n' "config file" "$CONFIG_FILE$([[ -f "$CONFIG_FILE" ]] || echo '  (not created yet)')"
+    if [[ -n "$CONFIG_SOURCE" && "$CONFIG_SOURCE" != "$CONFIG_FILE" ]]; then
+        printf '%-14s %s\n' "config file" "$CONFIG_SOURCE  (of user $SUDO_FROM, reused because root has none)"
+    else
+        printf '%-14s %s\n' "config file" "$CONFIG_FILE$([[ -f "$CONFIG_FILE" ]] || echo '  (not created yet)')"
+    fi
     for k in "${CONFIG_KEYS[@]}"; do
         v="${CFG[$k]}"
         case "$k" in
-            phrase)      if [[ -n "$v" ]]; then v="******** (set, ${#v} characters)"; else v="(not set - run: naat configure)"; fi ;;
+            phrase)      if [[ -n "$v" ]]; then v="******** (set, ${#v} characters)"; else v="(not set - run: $SELF configure)"; fi ;;
             scripts_dir) [[ -n "$v" ]] || v="$(scripts_dir)  (default)" ;;
             editor)      [[ -n "$v" ]] || v="$(pick_editor || echo none)  (auto)" ;;
         esac
@@ -846,14 +882,14 @@ configure_list() {
         if [[ -f "$HOME/.aws/$awsf" ]]; then
             printf '%-14s %s\n' "$([[ "$awsf" == credentials ]] && echo "aws keys" || echo "aws config")" "$HOME/.aws/$awsf$([[ "$awsf" == credentials ]] && printf '  (key %s)' "$(aws_key_hint "$HOME/.aws/$awsf")")"
         else
-            printf '%-14s %s\n' "$([[ "$awsf" == credentials ]] && echo "aws keys" || echo "aws config")" "(not present - run: naat configure aws)"
+            printf '%-14s %s\n' "$([[ "$awsf" == credentials ]] && echo "aws keys" || echo "aws config")" "(not present - run: $SELF configure aws)"
         fi
     done
     for awsf in .git-credentials .gitconfig; do
         if [[ -f "$HOME/$awsf" ]]; then
             printf '%-14s %s\n' "$([[ "$awsf" == .git-credentials ]] && echo "git login" || echo "git config")" "$HOME/$awsf$([[ "$awsf" == .git-credentials ]] && printf '  (%s)' "$(git_cred_hint "$HOME/$awsf")")"
         else
-            printf '%-14s %s\n' "$([[ "$awsf" == .git-credentials ]] && echo "git login" || echo "git config")" "(not present - run: naat configure github)"
+            printf '%-14s %s\n' "$([[ "$awsf" == .git-credentials ]] && echo "git login" || echo "git config")" "(not present - run: $SELF configure github)"
         fi
     done
     printf '%-14s %s\n' "token source" "$RAW_URL/${CFG[owner]}/${CFG[naat_repo]}/${CFG[naat_branch]}/$TOKEN_REPO_PATH"
@@ -966,7 +1002,7 @@ cmd_sync_token() {
     (( rc != 1 )) || die "no encrypted token published in ${CFG[owner]}/${CFG[naat_repo]} ($TOKEN_REPO_PATH)."
     (( rc == 0 )) || die "could not download the encrypted token (network?)."
     age_decrypt "${CFG[phrase]}" "$TOKEN_FILE" >/dev/null \
-        || die "downloaded, but the configured phrase does not decrypt it. Run: naat configure"
+        || die "downloaded, but the configured phrase does not decrypt it. Run: $SELF configure"
     info "Encrypted token refreshed from ${CFG[owner]}/${CFG[naat_repo]}."
 }
 
@@ -1093,7 +1129,7 @@ cmd_run() {
     base="$(tool_name "$1")"
     shift
     script="$(scripts_dir)/$base/$base.sh"
-    [[ -f "$script" ]] || die "'$base' is not downloaded yet. Run: naat download $base   (or: naat execute $base)"
+    [[ -f "$script" ]] || die "'$base' is not downloaded yet. Run: $SELF download $base   (or: $SELF execute $base)"
     chmod u+x "$script"
     exec "$script" "$@"
 }
