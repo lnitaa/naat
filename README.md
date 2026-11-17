@@ -88,7 +88,8 @@ Details:
   (`/folder | url | branch`) that exists on the server is registered as git
   `safe.directory` (fixes "detected dubious ownership"), gets `git init` if it is
   not a repository yet and the remote `origin`. A folder that already has files
-  is attached to the remote branch without touching them. Use
+  is attached to the remote branch without touching them. A folder that does
+  not exist is created with `git clone` (only if its parent folder exists). Use
   `sudo naat configure github` when the folder belongs to another user: it is
   then registered for all users and the new `.git` is handed to the folder owner.
 - Configuration is per Linux user. If a tool needs root, configure root too

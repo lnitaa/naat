@@ -23,7 +23,7 @@
 # =============================================================================
 set -euo pipefail
 
-NAAT_VERSION="0.4.0"
+NAAT_VERSION="0.5.0"
 
 NAAT_HOME="${NAAT_HOME:-$HOME/.naat}"
 CONFIG_FILE="$NAAT_HOME/config"
@@ -627,27 +627,65 @@ setup_git_repos() {
     return "$rc"
 }
 
-# setup_one_repo DIR URL BRANCH FORCE
-#   1. marks DIR as git "safe.directory" (fixes "detected dubious ownership")
-#   2. git init when DIR is not a repository yet
-#   3. adds the remote "origin" (asks before changing a different one)
-#   4. for a repository it just created: fetches and attaches the branch to
-#      origin WITHOUT touching the files already in the folder
-setup_one_repo() {
-    local dir="$1" url="$2" branch="$3" force="$4"
-    local owner cur scope="--global" fresh=0 empty=0 rc
-    if [[ ! -d "$dir" ]]; then
-        info "Git: $dir does not exist on this machine; skipped."
-        return 0
-    fi
-    owner="$(stat -c %U "$dir" 2>/dev/null || echo '?')"
-
+register_safe_dir() {   # fixes git's "detected dubious ownership" for DIR
+    local dir="$1" scope="--global"
     [[ "$(id -u)" == "0" ]] && scope="--system"
     if ! git config "$scope" --get-all safe.directory 2>/dev/null | grep -qxF "$dir"; then
         if git config "$scope" --add safe.directory "$dir"; then
             info "Git: $dir registered as safe.directory ($([[ "$scope" == --system ]] && echo 'all users' || echo "user $(id -un)"))."
         fi
     fi
+}
+
+# clone_missing_repo DIR URL BRANCH
+# DIR does not exist: create it with a normal `git clone`. Only when its parent
+# folder exists (a server without /odoo is left alone). Run as root, the new
+# folder is given the same owner as the parent folder.
+clone_missing_repo() {
+    local dir="$1" url="$2" branch="$3" parent
+    local -a flag=()
+    parent="$(dirname "$dir")"
+    if [[ -e "$dir" ]]; then
+        warn "$dir exists but is not a folder; skipped."
+        return 1
+    fi
+    if [[ ! -d "$parent" ]]; then
+        info "Git: $dir skipped ($parent does not exist on this machine)."
+        return 0
+    fi
+    if [[ ! -w "$parent" ]]; then
+        warn "$dir does not exist and $(id -un) cannot create it in $parent. Run: sudo naat configure github"
+        return 1
+    fi
+    [[ -n "$branch" ]] && flag=(--branch "$branch")
+    info "Git: $dir does not exist; cloning $url ..."
+    if ! git clone -q "${flag[@]}" "$url" "$dir"; then
+        warn "'git clone' failed for $dir (credentials, URL or branch '${branch:-default}'?). Nothing was created."
+        return 1
+    fi
+    register_safe_dir "$dir"
+    if [[ "$(id -u)" == "0" && "$(stat -c %U "$parent")" != "root" ]]; then
+        chown -R --reference="$parent" "$dir"
+    fi
+    info "Git: $dir created from $url ($(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null), owner $(stat -c %U "$dir"))."
+}
+
+# setup_one_repo DIR URL BRANCH FORCE
+#   1. marks DIR as git "safe.directory" (fixes "detected dubious ownership")
+#   0. DIR missing -> git clone (see clone_missing_repo)
+#   2. git init when DIR is not a repository yet
+#   3. adds the remote "origin" (asks before changing a different one)
+#   4. for a repository it just created: fetches and attaches the branch to
+#      origin WITHOUT touching the files already in the folder
+setup_one_repo() {
+    local dir="$1" url="$2" branch="$3" force="$4"
+    local owner cur fresh=0 empty=0 rc
+    if [[ ! -d "$dir" ]]; then
+        clone_missing_repo "$dir" "$url" "$branch"
+        return
+    fi
+    owner="$(stat -c %U "$dir" 2>/dev/null || echo '?')"
+    register_safe_dir "$dir"
 
     if [[ ! -e "$dir/.git" ]]; then
         if [[ ! -w "$dir" ]]; then
@@ -1076,7 +1114,8 @@ Setup
   configure github [--force]    Same for the git/GitHub login kept in banyan
                                 ($GITHUB_REPO_DIR): ~/.gitconfig, ~/.git-credentials.
                                 Also prepares the folders listed in its repos.conf:
-                                safe.directory, git init, remote origin
+                                safe.directory, git init, remote origin; a folder
+                                that does not exist is cloned
   configure set KEY VALUE       Change a setting (owner, naat_repo, naat_branch,
                                 tools_repo, ref, scripts_dir, editor)
   configure get KEY             Print one setting
